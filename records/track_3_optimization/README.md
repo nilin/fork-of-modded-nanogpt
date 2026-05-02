@@ -1,39 +1,44 @@
 # Modded-NanoGPT Optimization Benchmark
 
 The goal of this benchmark is to collaboratively|competitively find efficient neural network optimizers.
-Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any means, here we aim to minimize *step count* by improving the optimization algorithm (⇒ methods that are slow in terms of wallclock are perfectly OK).
+Unlike the main NanoGPT speedrun which seeks to minimize *wallclock time* by any means, here we aim to minimize *step count* by improving the optimization algorithm (⇒ methods that are slow in terms of wallclock are perfectly OK). [Longform announcement](https://x.com/kellerjordan0/status/2049193527440187494)
 
 ## Quickstart
 
 The baseline can be run using the following command on any {1,2,4,8}x-{A,H}100 machine:
 ```bash
 git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogpt
-pip install torch==2.10 huggingface_hub
+pip install torch==2.11 huggingface_hub
 python data/cached_fineweb10B.py 40  # downloads 4B training tokens
 torchrun --standalone --nproc_per_node=$(nvidia-smi -L | wc -l) records/track_3_optimization/train_gpt_simple.py
 ```
+
+Note: [Beware that](https://github.com/KellerJordan/modded-nanogpt/issues/268) on A100, using `torch==2.10` with `torch.compile` enabled will lead to `nan`s.
 
 ## Notable results history
 
 The following results each improved the best known hyperparameters for an optimizer on this benchmark.
 Many more non-SOTA results (e.g., from hyperparameter sweeps) can be found in `results/`.
 
-| # | Steps to 3.28 | Description | Date | Log | Contributors |
-| - | - | - | - | - | - |
-| 1 | 3600 | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.02 wd=.01 | 2026/04/26 | [log](results/7b8270c5-a9cd-4a73-b7d8-5d86a2d1e428.txt) | @kellerjordan0 |
-| 2 | 5625 | AdamW lr=0.0015 wd=0.1 betas=(0.9, 0.95) warmup_steps=250 | 2026/04/26 | [log](results/a63a68d1-24aa-4a22-af9a-224e43209ea4.txt) | @kellerjordan0 |
-| 3 | 3500 | [Muon](https://kellerjordan.github.io/posts/muon/) lr=.025 wd=.0125 | 2026/04/26 | [log](results/311d7833-8dfc-43ea-a55c-fd313a11c4a8.txt) | @kellerjordan0 |
+| # | Steps to 3.28 | Evidence | Description | Date | Log | Contributors |
+| - | - | - | - | - | - | - |
+| 1 | 3600 | 3.2777 (n=1)Ⓧ | [Muon](https://kellerjordan.github.io/posts/muon/) with aux Adam, lr=.02 wd=.01 | 2026/04/26 | [log](results/7b8270c5-a9cd-4a73-b7d8-5d86a2d1e428.txt) | @kellerjordan0 |
+| 2 | 5625 | 3.2790 (n=1)Ⓧ | AdamW lr=0.0015 wd=0.1 betas=(0.9, 0.95) warmup_steps=250 | 2026/04/26 | [log](results/a63a68d1-24aa-4a22-af9a-224e43209ea4.txt) | @kellerjordan0 |
+| 3 | 3500 | 3.2767 (n=1)Ⓧ | [Muon](https://kellerjordan.github.io/posts/muon/) with aux Adam, lr=.025 wd=.0125 | 2026/04/26 | [log](results/311d7833-8dfc-43ea-a55c-fd313a11c4a8.txt) | @kellerjordan0 |
+| 4 | 4875 | 3.2741 (n=5)✓ | [AdamH](https://psychedelic-sunstone-851.notion.site/Fantastic-Pretraining-Optimizers-and-Where-to-Find-Them-2-1-Hyperball-Optimization-2e924306e6f280e7a5ffee00eb40a0dd) (Adam preconditioning + hyperball constraint on hidden matrices) with per-module init std (attn.proj std=.026, mlp.proj std=.031, mlp.fc std=.031, qkv default), lr=.018 betas=(0.9, 0.95) warmup_steps=250 h_cooldown_frac=1.0 aux_cooldown_frac=.4 | 2026/04/30 | [log](results/20260430_adamh/7533dd87-107f-4a4f-8229-acbec0fb00ac.txt) | @kaiyue-wen |
+| 5 | 3325 | 3.2782 (n=10)✓ | [MuonH](https://psychedelic-sunstone-851.notion.site/Fantastic-Pretraining-Optimizers-and-Where-to-Find-Them-2-1-Hyperball-Optimization-2e924306e6f280e7a5ffee00eb40a0dd) (Muon + hyperball constraint on hidden matrices) with per-module init std (attn.proj std=.026, mlp.proj std=.031, mlp.fc std=.031, qkv default), lr=.018 h_cooldown_frac=1.0 aux_cooldown_frac=.4 | 2026/04/30 | [log](results/20260430_muonh/9319c798-6643-464a-b407-b05468e468f5.txt) | @kaiyue-wen |
+| 6 | 3375 | 3.2788 (n=20)✓ | [Muon](https://kellerjordan.github.io/posts/muon/) with aux Adam, lr=.025 wd=.025 | 2026/05/01 | [log](results/51ece938-03c5-4343-8dcc-3f3336b07008.txt) | @nilin, @alint77 |
 
 <img width="60%" src="figure.png"/>
 
 ## Rules
 
-To be considered valid, new results must:
-1. Keep the same dataset, batch size, and architecture as the baseline.
-2. Not perform multiple forward-backward passes per step. Each step must correspond to a single forward-backward.
+For a new result to be considered valid, the rules are as follows:
+1. The same dataset, batch size, and architecture must be kept the same as the baseline.
+2. The trainer cannot perform multiple forward-backward passes per step. Early-stopping based on val loss (or any other form of decision based on val loss) is also not allowed.
 3. Attain below 3.28 val loss, thereby matching [Andrej Karpathy's GPT-2 replication](https://github.com/karpathy/llm.c/discussions/481#:~:text=By%20the%20end%20of%20the%20optimization%20we%27ll%20get%20to%20about%203.29).
-To ensure statistical significance, the run(s) are required to pass a one-sided z-test assuming σ=0.00215 that achieves p<.01. E.g., for a single run, any val loss below 3.275 suffices, and for n=4 runs, any average below 3.2775 suffices. The general formula is that we require `(3.28 - mu) / n**0.5 < 0.005`, where `mu` is the average result over `n` non-cherry-picked runs.
-4. To ensure full reprodubility, all code needed to reproduce the run must be included in the logfile. In particular, third-party optimizer libraries should not be imported- instead, the necessary code should be copied in its entirety into the train script.
+To ensure statistical significance, the run(s) are required to pass a one-sided z-test assuming σ=0.0013 that achieves p<.001 (hence 3.09σ = 0.004 delta below the target). E.g., for a single non-cherry-picked run, any val loss below 3.276 suffices, and for n=4 runs, any average below 3.278 suffices. The general formula is that we require `(3.28 - mu) * n**0.5 >= 0.004`, where `mu` is the average result over `n` non-cherry-picked runs. (My first three results failed to follow this rule)
+4. To ensure full reprodubility, all code needed to reproduce the run must be included in the logfile. In particular, third-party optimizer libraries should not be imported. Instead, the necessary code should be copied in its entirety into the train script.
 
 New results have the freedom to modify:
 1. The optimization algorithm, even to something slow in terms of wallclock speed.

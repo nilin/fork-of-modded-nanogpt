@@ -37,17 +37,15 @@ def _load_data_shard(file: Path):
     return tokens
 
 def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
     files = sorted(Path.cwd().glob(filename_pattern))
-    assert batch_size % world_size == 0
-    local_batch_size = batch_size // world_size
+    assert batch_size % dist.get_world_size() == 0
+    local_batch_size = batch_size // dist.get_world_size()
     file_iter = iter(files)
     tokens, pos = _load_data_shard(next(file_iter)), 0
     while True:
         if pos + batch_size + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
-        buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
+        buf = tokens[pos + dist.get_rank() * local_batch_size:][:local_batch_size + 1]
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
         pos += batch_size
@@ -58,16 +56,13 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1
 #             Architecture             #
 ########################################
 
-def norm(x: Tensor):
-    return F.rms_norm(x, (x.size(-1),))
-
 class RMSNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.gains = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return (norm(x.float()) * self.gains).type_as(x)
+        return F.rms_norm(x, (x.size(-1),), weight=self.gains.type_as(x))
 
 class Linear(nn.Linear):
     def __init__(self, in_features, out_features):
@@ -109,7 +104,7 @@ class CausalSelfAttention(nn.Module):
         q = self.q(x).view(B, T, self.num_heads, self.head_dim)
         k = self.k(x).view(B, T, self.num_heads, self.head_dim)
         v = self.v(x).view(B, T, self.num_heads, self.head_dim)
-        q, k = norm(q), norm(k)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
         q, k = self.rotary(q), self.rotary(k)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
                                            v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
@@ -269,21 +264,22 @@ for _ in range(num_trials):
     ########################################
 
     # we want to minimize this while still reaching 3.28 val loss
-    train_steps = 3500
+    train_steps = 3375
 
     # initialize model parameters
     for name, p in model.named_parameters():
+        w = p.data
         if name.endswith("weight"):
             if "proj" in name:
-                p.data.zero_()
+                w.zero_()
             elif "embed" in name:
-                p.data.normal_()  # default torch init
+                w.normal_()  # default torch init
             else:
-                p.data.normal_(std=0.33**0.5 / p.size(-1)**0.5)  # default torch init
+                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
         elif name.endswith("bias"):
-            p.data.zero_()
+            w.zero_()
         elif name.endswith("gains"):
-            p.data.normal_(mean=1, std=0)
+            w.normal_(mean=1, std=0)
         else:
             raise Exception(f"Uninitialized parameter: {name}")
 
@@ -293,7 +289,7 @@ for _ in range(num_trials):
                         dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
                        betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
     optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                      lr=0.025, weight_decay=0.0125)
+                      lr=0.025, weight_decay=0.025)
     optimizers = [optimizer1, optimizer2]
     assert set(p for opt in optimizers for group in opt.param_groups
                for p in group["params"]) == set(model.parameters())

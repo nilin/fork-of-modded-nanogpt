@@ -1,8 +1,15 @@
 """
-train_gpt_simple.py
+train_gpt_simple_muonh.py
 
 This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
 It was prepared as a simplified version of the speedrun for use in neural net optimization research.
+
+Differs from `train_gpt_simple.py` only in the init and the optimizer: the matrix-parameter
+Muon update is replaced by MuonH (the same Newton-Schulz orthogonalised direction, applied
+via a hyperball projection that preserves the Frobenius norm of every hidden 2D weight
+matrix at every step), and the residual-side projections / mlp.fc are initialised with
+per-module multipliers on the default Kaiming init so MuonH has non-zero matrices to operate
+on from step 0.
 """
 
 import os
@@ -37,17 +44,15 @@ def _load_data_shard(file: Path):
     return tokens
 
 def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
     files = sorted(Path.cwd().glob(filename_pattern))
-    assert batch_size % world_size == 0
-    local_batch_size = batch_size // world_size
+    assert batch_size % dist.get_world_size() == 0
+    local_batch_size = batch_size // dist.get_world_size()
     file_iter = iter(files)
     tokens, pos = _load_data_shard(next(file_iter)), 0
     while True:
         if pos + batch_size + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
-        buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
+        buf = tokens[pos + dist.get_rank() * local_batch_size:][:local_batch_size + 1]
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
         pos += batch_size
@@ -58,16 +63,13 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1
 #             Architecture             #
 ########################################
 
-def norm(x: Tensor):
-    return F.rms_norm(x, (x.size(-1),))
-
 class RMSNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.gains = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return (norm(x.float()) * self.gains).type_as(x)
+        return F.rms_norm(x, (x.size(-1),), weight=self.gains.type_as(x))
 
 class Linear(nn.Linear):
     def __init__(self, in_features, out_features):
@@ -109,7 +111,7 @@ class CausalSelfAttention(nn.Module):
         q = self.q(x).view(B, T, self.num_heads, self.head_dim)
         k = self.k(x).view(B, T, self.num_heads, self.head_dim)
         v = self.v(x).view(B, T, self.num_heads, self.head_dim)
-        q, k = norm(q), norm(k)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
         q, k = self.rotary(q), self.rotary(k)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
                                            v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
@@ -192,11 +194,25 @@ def muon_update(grad, momentum, mu=0.95, nesterov=True):
     update *= max(1, grad.size(-2) / grad.size(-1))**0.5
     return update
 
-class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
+def scale_invariant_update_(param: Tensor, update: Tensor, lr: float, eps: float = 1e-10) -> None:
+    """Hyperball-constrained step: take a Muon-orthogonalised update of size lr * ||param||,
+    then renormalise back onto the Frobenius sphere of the parameter's initial radius. Preserves
+    ||param|| exactly across training; the invariant lets us drop weight decay on hidden
+    matrices entirely (the constraint already prevents norm growth)."""
+    p_norm = param.norm()
+    u_norm = update.norm()
+    new_param = param - lr * update * p_norm / torch.clamp(u_norm, min=eps)
+    new_norm = torch.clamp(new_param.norm(), min=eps)
+    param.copy_(new_param / new_norm * p_norm)
+
+class MuonH(torch.optim.Optimizer):
+    """MuonH: same Newton-Schulz orthogonalised direction as Muon, applied via a Frobenius-
+    norm-preserving hyperball projection. Used here for ALL hidden 2D weight matrices —
+    q, k, v, mlp.fc, attn.proj, mlp.proj — under non-zero (Kaiming-derived) init."""
+    def __init__(self, params, lr=0.014, mu=0.95):
         assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
         params = sorted(params, key=lambda x: x.size(), reverse=True)
-        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        defaults = dict(lr=lr, mu=mu)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -213,8 +229,7 @@ class Muon(torch.optim.Optimizer):
                     if len(state) == 0:
                         state["momentum"] = torch.zeros_like(p)
                     update = muon_update(p.grad, state["momentum"], mu=group["mu"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
+                    scale_invariant_update_(p, update, group["lr"])
                 dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
 
 
@@ -246,143 +261,146 @@ def print0(s, console=False, log=True):
 # we begin by logging this file itself
 print0(code)
 print0("="*100)
-print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
+       + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
 print0("="*100)
 
 val_tokens = 20 * 524288
 batch_size = 8 * 64 * 1024
 mbs = 64
-train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
 val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
 
 model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
 model.compile(dynamic=False)
 
 
-########################################
-#       Init & Optim Hyperparams       #
-########################################
+num_trials = int(sys.argv[-1]) if len(sys.argv) > 1 else 1
 
-# we want to minimize this while still reaching 3.28 val loss
-train_steps = 3550
+for _ in range(num_trials):
 
-# initialize model parameters
-for name, p in model.named_parameters():
-    if "proj" in name:
-        p.data.zero_()
 
-# create the optimizer(s)
-optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
-                    dict(params=[model.proj.weight], lr=1/320),
-                    dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
-                   betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
-optimizer2 = Muon([p for p in model.blocks.parameters() if p.ndim >= 2],
-                  lr=0.02, weight_decay=0.01)
-optimizers = [optimizer1, optimizer2]
-assert set(p for opt in optimizers for group in opt.param_groups
-           for p in group["params"]) == set(model.parameters())
-for opt in optimizers:
-    for group in opt.param_groups:
-        group["initial_lr"] = group["lr"]
+    ########################################
+    #       Init & Optim Hyperparams       #
+    ########################################
 
-# learning rate schedule: stable then decay
-def set_hparams(step, cooldown_frac=0.7):
-    progress = step / train_steps
-    assert 0 <= progress < 1
-    if progress < 1 - cooldown_frac:
-        eta = 1.0
-    else:
-        eta = (1 - progress) / cooldown_frac
+    # we want to minimize this while still reaching 3.28 val loss
+    train_steps = 3325
+
+    # initialize model parameters. Per-module multipliers on the default nn.Linear Kaiming-uniform
+    # init (std = 1/sqrt(3*fan_in), so ~0.0208 for fan_in=768 and ~0.0104 for fan_in=3072):
+    #   - attn.proj.weight (fan_in=768):  default × 1.25 → std ≈ 0.026
+    #   - mlp.proj.weight  (fan_in=3072): default × 3.0  → std ≈ 0.031
+    #   - mlp.fc.weight    (fan_in=768):  default × 1.5  → std ≈ 0.031
+    # qkv weights keep their default init. The vocab head (proj.weight) and all "proj" biases are
+    # zeroed so initial logits are 0.
+    for name, p in model.named_parameters():
+        w = p.data
+        if name.endswith("weight"):
+            if "embed" in name:
+                w.normal_()  # default torch init
+            else:
+                w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+        elif name.endswith("bias"):
+            w.zero_()
+        elif name.endswith("gains"):
+            w.normal_(mean=1, std=0)
+        else:
+            raise Exception(f"Uninitialized parameter: {name}")
+        if name.endswith(".attn.proj.weight"):
+            w.mul_(1.25)
+        elif name.endswith(".mlp.proj.weight"):
+            w.mul_(3.0)
+        elif name.endswith(".mlp.fc.weight"):
+            w.mul_(1.5)
+
+    # create the optimizer(s)
+    optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
+                        dict(params=[model.proj.weight], lr=1/320),
+                        dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
+                       betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
+    optimizer2 = MuonH([p for p in model.blocks.parameters() if p.ndim == 2], lr=0.018)
+    optimizers = [optimizer1, optimizer2]
+    assert set(p for opt in optimizers for group in opt.param_groups
+               for p in group["params"]) == set(model.parameters())
     for opt in optimizers:
         for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * eta
+            group["initial_lr"] = group["lr"]
+    for group in optimizer1.param_groups:
+        group["cooldown_frac"] = 0.4
+    for group in optimizer2.param_groups:
+        group["cooldown_frac"] = 1.0
+
+    # learning rate schedule: stable then decay. The h (MuonH) groups use full linear cooldown
+    # over the entire run (cooldown_frac=1.0); the aux (AdamW) group uses a shorter cooldown
+    # (cooldown_frac=0.4) to keep the embed/head learning longer before tapering.
+    def set_hparams(step):
+        progress = step / train_steps
+        assert 0 <= progress < 1
+        for opt in optimizers:
+            for group in opt.param_groups:
+                if progress < 1 - group["cooldown_frac"]:
+                    eta = 1.0
+                else:
+                    eta = (1 - progress) / group["cooldown_frac"]
+                group["lr"] = group["initial_lr"] * eta
 
 
-########################################
-#        Training and Validation       #
-########################################
+    ########################################
+    #        Training and Validation       #
+    ########################################
 
-for p in model.parameters():
-    dist.broadcast(p.detach(), 0)
-# start the clock
-training_time = 0
-dist.barrier()
-t0 = time.perf_counter()
-for step in range(train_steps + 1):
+    train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+    for p in model.parameters():
+        dist.broadcast(p.detach(), 0)
+    # start the clock
+    training_time = 0
+    last_val_step = 0
+    dist.barrier()
+    t0 = time.perf_counter()
+    for step in range(train_steps + 1):
 
-    # --------------- VALIDATION SECTION -----------------
-    if step == train_steps or step % 125 == 0:
-        # stop the clock
-        dist.barrier()
-        training_time += time.perf_counter() - t0
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            assert len(val_inputs) % mbs == 0
-            for i in range(len(val_inputs) // mbs):
-                val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
-        dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
-        val_loss /= val_tokens
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
-               + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
-        model.train()
-        # start the clock again
-        dist.barrier()
-        t0 = time.perf_counter()
+        # --------------- VALIDATION SECTION -----------------
+        if step == train_steps or step % 125 == 0:
+            # stop the clock
+            dist.barrier()
+            time_since_last_val = time.perf_counter() - t0
+            step_avg = time_since_last_val / (step - last_val_step) if step > 0 else float("nan")
+            last_val_step = step
+            training_time += time_since_last_val
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                assert len(val_inputs) % mbs == 0
+                for i in range(len(val_inputs) // mbs):
+                    val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+            dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+            val_loss /= val_tokens
+            print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
+                   + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+            model.train()
+            # start the clock again
+            dist.barrier()
+            t0 = time.perf_counter()
 
-    if step == train_steps:
-        break
+        if step == train_steps:
+            break
 
-    # --------------- TRAINING SECTION -----------------
-    inputs, targets = next(train_loader)
-    # accumulate across microbatches in case we are running with fewer than 8 gpus
-    assert len(inputs) % mbs == 0
-    for i in range(len(inputs) // mbs):
-        model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
-    for name, p in model.named_parameters():
-        assert p.grad is not None, name
-        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-    # set optimization hyperparameters and take a step
-    set_hparams(step)
-    for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
-    approx_training_time = training_time + (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
-           + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
+        # --------------- TRAINING SECTION -----------------
+        inputs, targets = next(train_loader)
+        # accumulate across microbatches in case we are running with fewer than 8 gpus
+        assert len(inputs) % mbs == 0
+        for i in range(len(inputs) // mbs):
+            model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs]).backward()
+        for name, p in model.named_parameters():
+            assert p.grad is not None, name
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        # set optimization hyperparameters and take a step
+        set_hparams(step)
+        for opt in optimizers:
+            opt.step()
+        model.zero_grad(set_to_none=True)
+        approx_training_time = training_time + (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
+               + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True, log=False)
 
 dist.destroy_process_group()
-
-====================================================================================================
-Running PyTorch 2.10.0+cu128 compiled for CUDA 12.8
-====================================================================================================
-step:0/3550 val_loss:10.82584 train_time:0.000s step_avg:0.08ms
-step:125/3550 val_loss:4.63052 train_time:30.009s step_avg:240.07ms
-step:250/3550 val_loss:4.10432 train_time:49.232s step_avg:196.93ms
-step:375/3550 val_loss:3.91744 train_time:68.308s step_avg:182.16ms
-step:500/3550 val_loss:3.81346 train_time:87.398s step_avg:174.80ms
-step:625/3550 val_loss:3.74239 train_time:106.481s step_avg:170.37ms
-step:750/3550 val_loss:3.69264 train_time:125.564s step_avg:167.42ms
-step:875/3550 val_loss:3.64949 train_time:144.656s step_avg:165.32ms
-step:1000/3550 val_loss:3.61357 train_time:163.738s step_avg:163.74ms
-step:1125/3550 val_loss:3.58749 train_time:182.812s step_avg:162.50ms
-step:1250/3550 val_loss:3.55499 train_time:201.907s step_avg:161.53ms
-step:1375/3550 val_loss:3.52773 train_time:221.000s step_avg:160.73ms
-step:1500/3550 val_loss:3.49911 train_time:240.077s step_avg:160.05ms
-step:1625/3550 val_loss:3.48031 train_time:259.177s step_avg:159.49ms
-step:1750/3550 val_loss:3.45946 train_time:278.285s step_avg:159.02ms
-step:1875/3550 val_loss:3.44070 train_time:297.375s step_avg:158.60ms
-step:2000/3550 val_loss:3.42294 train_time:316.482s step_avg:158.24ms
-step:2125/3550 val_loss:3.40744 train_time:335.596s step_avg:157.93ms
-step:2250/3550 val_loss:3.39302 train_time:354.687s step_avg:157.64ms
-step:2375/3550 val_loss:3.37853 train_time:373.787s step_avg:157.38ms
-step:2500/3550 val_loss:3.36541 train_time:392.887s step_avg:157.15ms
-step:2625/3550 val_loss:3.35230 train_time:411.964s step_avg:156.94ms
-step:2750/3550 val_loss:3.33976 train_time:431.144s step_avg:156.78ms
-step:2875/3550 val_loss:3.32820 train_time:450.252s step_avg:156.61ms
-step:3000/3550 val_loss:3.31671 train_time:469.341s step_avg:156.45ms
-step:3125/3550 val_loss:3.30525 train_time:488.445s step_avg:156.30ms
-step:3250/3550 val_loss:3.29491 train_time:507.554s step_avg:156.17ms
-step:3375/3550 val_loss:3.28673 train_time:526.630s step_avg:156.04ms
-step:3500/3550 val_loss:3.28101 train_time:545.738s step_avg:155.93ms
-step:3550/3550 val_loss:3.28007 train_time:553.377s step_avg:155.88ms
