@@ -9,8 +9,6 @@ Newton-Schulz momentum update subtracts CONTRA_MUON / 2 times the operator-norma
 momentum gradient before the PR 274 NorMuon-lite row/column variance normalization and
 u/w-floor postprocessing. Here CONTRA_MUON=0.4, so the subtracted component is 0.2 times
 the normalized gradient.
-
-rebased onto the PR 274 Skylight-001 script: the Muon
 """
 
 import os
