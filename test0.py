@@ -1,4 +1,8 @@
 """
+
+THIS TEST SCRIPT IS FOR TUNING
+
+
 train_gpt_simple_contra_muon_v2.py
 
 This file descends from the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt).
