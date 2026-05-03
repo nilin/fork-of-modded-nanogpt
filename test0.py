@@ -31,9 +31,9 @@ import torch.distributed as dist
 torch.backends.cuda.enable_cudnn_sdp(False)
 
 SEED = int(os.environ.get("SEED", "0"))
-CONTRA_MUON = 0.4
+CONTRA_MUON = 0.5
 MU = 0.95
-MUON_LR = 0.0375
+MUON_LR = 0.05
 TARGET_UW = 0.35
 
 
@@ -363,7 +363,7 @@ for opt in optimizers:
         group["initial_lr"] = group["lr"]
 
 # learning rate schedule: stable then decay
-def set_hparams(step, cooldown_frac=0.7):
+def set_hparams(step, cooldown_frac=1.0):
     progress = step / train_steps
     assert 0 <= progress < 1
     if progress < 1 - cooldown_frac:
