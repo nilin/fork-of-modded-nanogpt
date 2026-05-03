@@ -338,9 +338,9 @@ model.compile(dynamic=False)
 ########################################
 
 # we want to minimize this while still reaching 3.28 val loss
-train_steps = 3250
+train_steps = 3200
 val_regular_interval = 125
-extra_val_steps = {3200, 3210, 3220}
+extra_val_steps = {3150, 3180, 3190}
 
 # initialize model parameters
 for name, p in model.named_parameters():
